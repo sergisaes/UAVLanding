@@ -1,6 +1,9 @@
 %% ============================================================
-% simluation_code.m  
-% WITH FINAL LANDING (FLARE MANEUVER)
+% uav_landing_paper_TARGET_V13_VELOCITY_CHECK.m
+% CORRECCIÓN FINAL:
+% - Añadido chequeo de VELOCIDAD DEL DECK.
+% - El dron no aterrizará si la plataforma se mueve rápido (>0.5 m/s).
+% - Espera a momentos de "calma" en el movimiento random.
 % =============================================================
 clear; clc;
 
@@ -14,152 +17,145 @@ quad_base   = sim.getObject('/Quadcopter');
 quad_target = sim.getObject('/target');     
 deck        = sim.getObject('/OmniPlatform');
 
-[cite_start]%% 2) PHYSICAL PARAMETERS (Paper Eq 1-3) [cite: 83]
-physParams.Ax = 0.20; physParams.wx = 0.6; physParams.phx = 0;
-physParams.Ay = 0.15; physParams.wy = 0.5; physParams.phy = 0;
-physParams.Ah = 0.10; physParams.wz = 0.7; physParams.phz = 0;
+%% 2) PHYSICAL PARAMETERS
+GT.Ax = 0.20; GT.Ay = 0.15; GT.Ah = 0.10;
+noise_factor = 1.0 + (randn()*0.05); 
+physParams.Ax = 0.20 * noise_factor; physParams.wx = 0.6; physParams.phx = 0;
+physParams.Ay = 0.15 * noise_factor; physParams.wy = 0.5; physParams.phy = 0;
+physParams.Ah = 0.10 * noise_factor; physParams.wz = 0.7; physParams.phz = 0;
 physParams.vx = 0.02; physParams.vy = -0.01;
 
-%% 3) STATE INITIALIZATION
+physParams.A_pitch = 0; physParams.w_pitch = 0.6; physParams.ph_pitch = 0;
+physParams.A_roll  = 0; physParams.w_roll  = 0.5; physParams.ph_roll  = 0;
+
+%% 3) SENSORS
+Sensor.FOV_deg = 60; Sensor.MaxRange = 5.0; 
+Sensor.PosNoise = 0.02; Sensor.VelNoise = 0.05; Sensor.DropOutProb = 0.02;
+
+%% 4) STATE INITIALIZATION
 deck0 = cell2mat(sim.getObjectPosition(deck,-1))';
-uav0  = cell2mat(sim.getObjectPosition(quad_base,-1))';
-
-% Kalman State: [x, vx, y, vy, z, vz] initialized to the DECK's position
-xk = [deck0(1); 0; deck0(2); 0; deck0(3); 0];
-Pk = eye(6) * 0.1;
-
-% Kalman Parameters
+xk = [deck0(1); 0; 0; deck0(2); 0; 0; deck0(3); 0; 0];
+Pk = eye(9) * 0.1;
 dt = 0.05;
-F = eye(6); F(1,2)=dt; F(3,4)=dt; F(5,6)=dt;
-Q = eye(6)*1e-4; H = [1 0 0 0 0 0; 0 0 1 0 0 0; 0 0 0 0 1 0]; R = eye(3)*1e-3;
+F = eye(9); F(1,2)=dt; F(1,3)=0.5*dt^2; F(2,3)=dt; 
+F(4,5)=dt; F(4,6)=0.5*dt^2; F(5,6)=dt; F(7,8)=dt; F(7,9)=0.5*dt^2; F(8,9)=dt; 
+Q = eye(9)*1e-4; H = zeros(3,9); H(1,1)=1; H(2,4)=1; H(3,7)=1; 
+R = eye(3)*(Sensor.PosNoise^2); 
 
-%% 4) GRU HISTORY & FLARE VARIABLES
-N = 20;
-history = zeros(N, 6); 
-for i=1:N
-    % Pre-fill history with static initial deck state to avoid pvis=0 (cold start)
-    history(i,:) = [deck0(1), deck0(2), 0, 0, 0, 1];
-end
+%% 5) FLAGS & TIMERS
+isFlaring = false; flareStartTime = 0; flareDuration = 2.5; 
+flareStartOffset = 0; hasLanded = false;
 
-% --- NEW VARIABLES FOR FLARE ---
-isFlaring = false;       % Are we currently executing the landing maneuver?
-flareStartTime = 0;
-flareDuration = 2.5;     % Seconds to touch the deck surface
-flareStartOffset = 0;    % Relative height when flare starts
-hasLanded = false;
+approachTimer = 0; 
+REQUIRED_STABLE_TIME = 1.5; % Reducido ligeramente para aprovechar oportunidades
 
-%% 5) ONNX LOADING
-onnxFile = 'gru_paper.onnx'; 
-useOnnx = false;
-if isfile(onnxFile)
-    try
-        net = importONNXNetwork(onnxFile, 'OutputLayerType','regression');
-        useOnnx = true;
-    catch, warning('ONNX failed.'); 
-    end
-end
+%% 6) ONNX
+onnxFile = 'gru_paper.onnx'; useOnnx = false;
+if isfile(onnxFile), try, net = importONNXNetwork(onnxFile,'OutputLayerType','regression'); useOnnx = true; catch, end, end
 
 %% ============================================================
 % MAIN LOOP
 % ============================================================
 max_time = 180;
 t = 0;
-disp('Starting Control with Flare...');
+disp('Starting Control (Velocity Safety Check)...');
 
 while sim.getSimulationState() ~= sim.simulation_stopped  &&  t < max_time
     
     %% (1) SENSORS
-    % Simulating Vision: Reading the true deck position
-    real_deck_pos = cell2mat(sim.getObjectPosition(deck,-1))';
-    % Reading UAV position (for relative distance)
-    uav_pos       = cell2mat(sim.getObjectPosition(quad_base,-1))';
+    GT_deck_pos = cell2mat(sim.getObjectPosition(deck,-1))';
+    GT_uav_pos  = cell2mat(sim.getObjectPosition(quad_base,-1))';
+    meas_uav_vel = cell2mat(sim.getObjectVelocity(quad_base))' + randn(3,1)*Sensor.VelNoise;
     
-    %% (2) KALMAN UPDATE
+    rel_vec = GT_deck_pos - GT_uav_pos;
+    dist_to_deck = norm(rel_vec);
+    angle_off_nadir = atan2(norm(rel_vec(1:2)), abs(rel_vec(3))); 
+    is_visible = (rad2deg(angle_off_nadir) < Sensor.FOV_deg/2) && (dist_to_deck < Sensor.MaxRange);
+    if rand() < Sensor.DropOutProb, is_visible = false; end
+    
+    if is_visible, z_meas = GT_deck_pos + randn(3,1)*Sensor.PosNoise; has_vision = 1;
+    else, z_meas = [NaN; NaN; NaN]; has_vision = 0; end
+    
+    %% (2) KALMAN
     xk = F*xk; Pk = F*Pk*F' + Q;
-    K = Pk*H'/(H*Pk*H' + R);
-    xk = xk + K*(real_deck_pos - H*xk);
-    Pk = (eye(6)-K*H)*Pk;
+    if has_vision
+        y_res = z_meas - H*xk; S = H*Pk*H' + R; K = Pk*H'/S;
+        xk = xk + K*y_res; Pk = (eye(9)-K*H)*Pk;
+    end
     
-    %% (3) PHYSICAL PREDICTION
-    pred_horizon = dt * 2.0; 
-    t_future = t + pred_horizon;
+    %% (3) PREDICTION
+    pred_horizon = dt * 2.0; t_future = t + pred_horizon;
+    pred_pitch = physParams.A_pitch * sin(physParams.w_pitch * t_future + physParams.ph_pitch);
+    pred_roll  = physParams.A_roll  * sin(physParams.w_roll  * t_future + physParams.ph_roll);
     
-    [cite_start]% Hybrid Model: Kalman Trend + Model Oscillation [cite: 83]
-    osc_z = physParams.Ah * sin(physParams.wz * t_future + physParams.phz);
+    xk_z_trend = xk(7) + xk(8)*pred_horizon;
+    wave_z = physParams.Ah * sin(physParams.wz * t_future + physParams.phz);
+    p_total = [xk(1)+xk(2)*pred_horizon; xk(4)+xk(5)*pred_horizon; xk_z_trend+wave_z];
     
-    p_phys_x = xk(1) + xk(2)*pred_horizon; % X Trend (Kalman estimated)
-    p_phys_y = xk(3) + xk(4)*pred_horizon; % Y Trend
-    p_phys_z = xk(5) + osc_z;              % Z Trend (Kalman base + Wave offset)
+    %% (4) CONFIDENCE
+    uncert = trace(Pk(1:2:9, 1:2:9)); 
+    if uncert < 0.05, pvis_sim = 0.95; elseif uncert < 0.3, pvis_sim = 0.6; else, pvis_sim = 0.2; end
+    if has_vision == 0, pvis_sim = 0.3; end
+    pvis = pvis_sim; if t < 3.0, pvis = 1.0; end 
     
-    p_total = [p_phys_x; p_phys_y; p_phys_z];
+    %% (5) CONTROL LOGIC
+    dist_z = GT_uav_pos(3) - p_total(3);
+    dist_xy = norm(GT_uav_pos(1:2) - p_total(1:2));
     
-    %% (4) GRU / AI
-    % Update history with the current estimated DECK state
-    new_feat = [xk(1), xk(3), xk(2), xk(4), 0, 1]; 
-    history = [history(2:end,:); new_feat];
+    % --- NUEVO: ESTIMACIÓN DE VELOCIDAD DEL DECK ---
+    % Usamos el estado del Kalman (indices 2 y 5 son velocidades X e Y)
+    deck_vel_x = xk(2);
+    deck_vel_y = xk(5);
+    deck_speed = norm([deck_vel_x, deck_vel_y]);
     
-    pvis = 0.5; % Default value
-    if useOnnx, pvis = 0.9; end
-    if t < 3.0, pvis = 1.0; end % Temporary confidence boost for Warmup
-    
-    %% (5) CONTROL LOGIC (FLARE VS FUZZY)
-    % Relative vertical distance (UAV Z - Predicted Deck Z)
-    dist_z = uav_pos(3) - p_total(3);
-    
-    % -- FLARE LOGIC --
     if hasLanded
-        mode = "LANDED";
-        mode_idx = 5;
-        % Stick to the deck (slightly negative offset to ensure contact)
-        target_ref = [p_total(1); p_total(2); p_total(3) - 0.2]; 
+        sim.stopSimulation(); break; 
         
     elseif isFlaring
         mode = "FLARE";
-        mode_idx = 6;
-        
-        % Calculate flare time
-        t_elapsed = t - flareStartTime;
-        progress = min(t_elapsed / flareDuration, 1.0);
-        
-        % Descent ramp: Current offset down to 0 (or slightly negative)
-        % This offset is added to p_total(3), ensuring wave synchronization during descent.
+        progress = min((t - flareStartTime) / flareDuration, 1.0);
         current_offset = flareStartOffset * (1 - progress);
-        
-        % If ramp finished, mark landed
-        if progress >= 1.0
-            hasLanded = true;
-            disp('--- TOUCHDOWN ---');
-        end
-        
+        if progress >= 1.0, hasLanded = true; disp('=== TOUCHDOWN ==='); end
         target_ref = [p_total(1); p_total(2); p_total(3) + current_offset];
         
     else
-        % -- NORMAL FUZZY LOGIC --
-        % Normalized distance: 1 = Far/Safe, 0 = Close/Danger
+        % Inputs Fuzzy
         dnorm = min(max((dist_z - 0.1)/1.5, 0), 1);
-        [mode, mode_idx] = fuzzy_logic_corrected(pvis, dnorm);
+        [mode, ~] = fuzzy_logic_stable(pvis, dnorm, pred_pitch, pred_roll);
         
-        % Check FLARE TRIGGER (Override Fuzzy for final commitment)
-        % If mode is APPROACH/DESCEND, highly confident, and close enough
-        if (strcmp(mode, "APPROACH") || strcmp(mode, "DESCEND")) && dist_z < 1.2 && pvis > 0.7
-            isFlaring = true;
-            flareStartTime = t;
-            flareStartOffset = dist_z; % Start height for the ramp
-            disp('--- INICIATING FLARE ---');
+        % --- TIMER CON RESET POR MOVIMIENTO BRUSCO ---
+        is_deck_calm = (deck_speed < 0.5); % Umbral: 0.5 m/s
+        
+        if strcmp(mode, "APPROACH") && is_deck_calm
+            approachTimer = approachTimer + dt;
+        else
+            % Si salimos de approach O el barco acelera -> Reset Timer
+            approachTimer = 0; 
         end
         
-        % Normal Fuzzy Setpoints
+        % --- TRIGGER FINAL ---
+        ready_to_flare = (strcmp(mode, "APPROACH") && pvis > 0.85);
+        stable_enough  = (approachTimer > REQUIRED_STABLE_TIME);
+        aligned_xy     = (dist_xy < 0.3);
+        
+        % Añadimos 'is_deck_calm' al trigger final para seguridad doble
+        if ready_to_flare && dist_z < 1.3 && stable_enough && aligned_xy && is_deck_calm
+            isFlaring = true;
+            flareStartTime = t;
+            flareStartOffset = dist_z;
+            disp(['--- FLARE TRIGGERED (Deck Speed: ' num2str(deck_speed) ' m/s) ---']);
+        end
+        
         switch mode
             case "DESCEND"
                 target_ref = p_total; 
             case "APPROACH"
-                z_hover = p_total(3) + 0.8; % Hold 80cm above the wave
+                z_hover = p_total(3) + 0.8; 
                 target_ref = [p_total(1); p_total(2); z_hover];
             case "HOLD"
-                target_ref = [xk(1); xk(3); uav_pos(3)];
+                target_ref = [xk(1); xk(4); GT_uav_pos(3)];
             case "ABORT"
-                safe_altitude = deck0(3) + 2.5; % Fixed safe height
-                target_ref = [xk(1); xk(3); safe_altitude];
+                target_ref = [xk(1); xk(4); deck0(3) + 2.5];
         end
     end
     
@@ -167,46 +163,39 @@ while sim.getSimulationState() ~= sim.simulation_stopped  &&  t < max_time
     curr_target = cell2mat(sim.getObjectPosition(quad_target,-1))';
     vec = target_ref - curr_target;
     
-    % Adjust speed limit for Flare maneuver
-    if isFlaring, speed_limit = 2.0; else, speed_limit = 1.0; end
+    % Aumentamos agilidad en Approach para seguir movimientos random
+    speed_limit = isFlaring * 2.0 + (~isFlaring) * 2.5; 
     
-    max_step = speed_limit * dt;
-    if norm(vec) > max_step
-        vec = vec * (max_step / norm(vec));
-    end
+    if norm(vec) > speed_limit*dt, vec = vec*(speed_limit*dt/norm(vec)); end
     sim.setObjectPosition(quad_target, -1, (curr_target + vec)');
     
-    %% DEBUG
     if mod(t, 0.5) < dt
-        fprintf('T:%.1f | Mode:%s | DeckZ:%.2f | UAV_Z:%.2f | Offset:%.2f\n', ...
-            t, mode, real_deck_pos(3), uav_pos(3), dist_z);
+        fprintf('T:%.1f|Md:%s|Pvis:%.2f|Z:%.2f|DeckVel:%.2f|Tmr:%.1f\n', ...
+            t, mode, pvis, dist_z, deck_speed, approachTimer);
     end
-    
-    pause(dt);
-    t = t + dt;
+    pause(dt); t = t + dt;
 end
-sim.stopSimulation();
+try, sim.stopSimulation(); catch, end
 
-%% FUZZY FUNCTION (Identical to V3 logic)
-function [s_str, idx] = fuzzy_logic_corrected(pvis, d)
-    % Based on Paper Table I: Pvis vs D (Distance/Clearance)
+%% FUZZY FUNCTION
+function [s_str, idx] = fuzzy_logic_stable(pvis, d, pitch, roll)
+    s_str = "ABORT"; idx = 1;
+    if abs(pitch) > deg2rad(10) || abs(roll) > deg2rad(10), return; end
+
     TH_LOW_P = 0.4; TH_HI_P = 0.7;
-    TH_LOW_D = 0.3; TH_HI_D = 0.8;
+    TH_LOW_D = 0.2; TH_HI_D  = 0.8; 
     
     if pvis < TH_LOW_P 
         if d < TH_LOW_D, s_str="ABORT"; idx=1; else, s_str="HOLD"; idx=2; end
     elseif pvis < TH_HI_P
         if d < TH_LOW_D, s_str="ABORT"; idx=1; else, s_str="APPROACH"; idx=3; end
-    else
-        if d < TH_LOW_D, s_str="ABORT"; idx=1; 
-        elseif d > TH_HI_D, s_str="DESCEND"; idx=4; 
-        else, s_str="APPROACH"; idx=3; 
+    else 
+        if d < TH_LOW_D, s_str="ABORT"; idx=1;
+        elseif d > TH_HI_D
+            s_str="DESCEND"; idx=4;
+        else
+            s_str="APPROACH"; idx=3; 
         end
     end
-    
-    % Override to descend fast if too high (helps with initial engagement)
-    if d > 0.9
-         s_str="APPROACH"; idx=3;
-         if pvis > 0.8, s_str="DESCEND"; idx=4; end
-    end
+    if d > 0.9 && pvis > 0.8, s_str="DESCEND"; idx=4; end
 end

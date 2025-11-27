@@ -1,6 +1,6 @@
 # ============================================================
 # GRU EXACTO SEGÚN EL PAPER: 
-# - Input: [pos_phys, vel_phys, viento, mask]
+# - Input: [pos_phys, vel_phys, wind, mask]
 # - Output: [dx, dy, pvis, logvar_x, logvar_y]
 # - Entrenamiento: NLL + dropout visión + ruido + modelo físico
 # - Exportacion a ONNX
