@@ -15,6 +15,8 @@
 Marcel Naderer, **Sergi Sanmartin**, Gaëtan Soudée, Yu-Chen Liu, Min-Fan Ricky Lee *(Member, IEEE)*
 *MCI Innsbruck · UPC Barcelona · ECE Paris · National Taiwan University of Science and Technology*
 
+**[📄 Read the full paper (PDF)](paper/Real-Time_Hybrid_Predictive_Fuzzy_Control_for_UAV_Landing.pdf)**
+
 > **Abstract.** The autonomous landing of multirotor UAVs on moving platforms is challenging due to
 > coupled deck motion, environmental disturbances and intermittent perception. We present a real-time
 > hybrid predictive fuzzy landing supervisor combining a physics-based deck-motion model, a data-driven
